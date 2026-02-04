@@ -1,4 +1,4 @@
-# root
+# signal
 
 a backend microservice that helps identify **likely root causes of incidents** (e.g. production failures, CI issues) by analyzing time-series metrics and discrete system events.
 
