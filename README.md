@@ -283,13 +283,7 @@ curl http://localhost:8000/analysis/{incident_id}
 
 ## future improvements
 
-- [ ] machine learning models for anomaly detection (LSTM, Prophet)
-- [ ] bayesian inference for cause likelihood
-- [ ] seasonality-aware baselines
-- [ ] dependency graph analysis
-- [ ] real-time streaming ingestion (kafka/rabbitmq)
-- [ ] grafana/datadog integration
-- [ ] alert routing based on confidence thresholds
+tbd
 
 ---
 
