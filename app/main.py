@@ -11,7 +11,7 @@ from collections import defaultdict
 from datetime import timedelta
 import math
 
-from app.schemas import AnalysisResponse, AnomalyOut, CauseOut
+from app.schemas import AnalysisResponse, AnomalyOut, CauseOut, EpisodeOut
 
 
 app = FastAPI()
@@ -129,19 +129,16 @@ def ingest(payload: IngestRequest, db: Session = Depends(get_db)):
 
 @app.get("/analysis/{incident_id}", response_model=AnalysisResponse)
 def analyze_incident(incident_id: str, db: Session = Depends(get_db)):
-    # 1) Load incident
     incident = db.get(models.Incident, incident_id)
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    # 2) Load metrics + events for this incident
     metric_points = (
         db.query(models.MetricPoint)
         .filter(models.MetricPoint.incident_id == incident_id)
         .order_by(models.MetricPoint.metric_name, models.MetricPoint.ts)
         .all()
     )
-
     events = (
         db.query(models.Event)
         .filter(models.Event.incident_id == incident_id)
@@ -149,34 +146,32 @@ def analyze_incident(incident_id: str, db: Session = Depends(get_db)):
         .all()
     )
 
-    # Group metrics by name
+    # ---- 1) group points by metric ----
     by_metric = defaultdict(list)
     for mp in metric_points:
         by_metric[mp.metric_name].append(mp)
 
-    anomalies: list[AnomalyOut] = []
+    # ---- 2) detect point anomalies (z-score vs baseline) ----
+    point_anoms: list[AnomalyOut] = []
+    z_threshold = 3.0
 
-    # 3) Detect anomalies with a simple baseline z-score
-    # Baseline = first N points in that metric stream (min 10, max 30)
     for metric_name, pts in by_metric.items():
-        if len(pts) < 6:
+        if len(pts) < 12:
             continue
 
-        baseline_n = min(30, max(10, len(pts) // 5))
+        baseline_n = min(30, max(10, len(pts) // 4))
         baseline = pts[:baseline_n]
 
         mean = sum(p.value for p in baseline) / len(baseline)
         var = sum((p.value - mean) ** 2 for p in baseline) / len(baseline)
         std = math.sqrt(var)
-
-        # If std is ~0, z-score isn't meaningful
         if std < 1e-9:
             continue
 
         for p in pts[baseline_n:]:
             z = (p.value - mean) / std
-            if abs(z) >= 3.0:
-                anomalies.append(
+            if abs(z) >= z_threshold:
+                point_anoms.append(
                     AnomalyOut(
                         metric_name=metric_name,
                         ts=p.ts,
@@ -187,62 +182,160 @@ def analyze_incident(incident_id: str, db: Session = Depends(get_db)):
                     )
                 )
 
-    # Sort anomalies chronologically
-    anomalies.sort(key=lambda a: a.ts)
+    point_anoms.sort(key=lambda a: a.ts)
 
-    # 4) Link anomalies to nearby events and rank likely causes
-    # Window: +/- 5 minutes around anomaly timestamp
-    window = timedelta(minutes=5)
+    # ---- 3) collapse anomalies into "episodes" per metric ----
+    # If anomalies are within 2 minutes, treat as one episode.
+    episode_gap = timedelta(minutes=2)
 
-    # Count how often each event is "near" anomalies, and compute a proximity score
-    cause_stats = {}  # key: event_id -> dict(score, evidence, event_obj)
-    for a in anomalies:
-        for ev in events:
-            if ev.ts is None:
+    episodes = []  # each: dict(metric, start, end, max_abs_z, mean, std, max_value)
+    by_metric_anoms = defaultdict(list)
+    for a in point_anoms:
+        by_metric_anoms[a.metric_name].append(a)
+
+    for metric_name, anoms in by_metric_anoms.items():
+        current = None
+        for a in anoms:
+            if current is None:
+                current = {
+                    "metric": metric_name,
+                    "start": a.ts,
+                    "end": a.ts,
+                    "max_abs_z": abs(a.z_score),
+                    "baseline_mean": a.baseline_mean,
+                    "baseline_std": a.baseline_std,
+                    "max_value": a.value,
+                }
                 continue
-            dt = abs(a.ts - ev.ts)
+
+            if a.ts - current["end"] <= episode_gap:
+                current["end"] = a.ts
+                current["max_abs_z"] = max(current["max_abs_z"], abs(a.z_score))
+                current["max_value"] = max(current["max_value"], a.value)
+            else:
+                episodes.append(current)
+                current = {
+                    "metric": metric_name,
+                    "start": a.ts,
+                    "end": a.ts,
+                    "max_abs_z": abs(a.z_score),
+                    "baseline_mean": a.baseline_mean,
+                    "baseline_std": a.baseline_std,
+                    "max_value": a.value,
+                }
+        if current is not None:
+            episodes.append(current)
+
+    episodes.sort(key=lambda e: e["start"])
+
+    episodes_out: list[EpisodeOut] = []
+
+    for ep in episodes:
+        pct = 0.0
+        if ep["baseline_mean"] and abs(ep["baseline_mean"]) > 1e-9:
+            pct = (ep["max_value"] - ep["baseline_mean"]) / ep["baseline_mean"] * 100.0
+
+        episodes_out.append(
+            EpisodeOut(
+                metric_name=ep["metric"],  # <-- FIXED comma issue
+                start_ts=ep["start"],
+                end_ts=ep["end"],
+                baseline_mean=ep["baseline_mean"],
+                baseline_std=ep["baseline_std"],
+                peak_value=ep["max_value"],
+                peak_z_score=ep["max_abs_z"],
+                percent_change=round(pct, 2),
+            )
+        )
+
+    # ---- 4) compute multi-metric agreement (episode overlap) ----
+    # if latency + error_rate overlap in time, boost.
+    def overlaps(a_start, a_end, b_start, b_end) -> bool:
+        return not (a_end < b_start or b_end < a_start)
+
+    agreement_bonus = defaultdict(float)  # episode_index -> bonus
+    for i, e1 in enumerate(episodes):
+        for j, e2 in enumerate(episodes):
+            if i >= j:
+                continue
+            if overlaps(e1["start"], e1["end"], e2["start"], e2["end"]):
+                # simple: boost both
+                agreement_bonus[i] += 0.35
+                agreement_bonus[j] += 0.35
+
+    # ---- 5) link episodes to events & score causes ----
+    # event priors (feel free to tweak later)
+    event_prior = {
+        "deploy": 1.00,
+        "config_change": 0.85,
+        "feature_flag": 0.75,
+        "db_migration": 0.80,
+        "incident_note": 0.50,
+    }
+
+    window = timedelta(minutes=10)
+
+    # score per event id
+    cause = {}  # ev.id -> dict(score, evidence, event)
+    max_possible = 0.0
+
+    for idx, ep in enumerate(episodes):
+        # severity: cap z so it doesn't explode
+        severity = min(10.0, ep["max_abs_z"]) / 10.0  # 0..1
+        sev_weight = 0.55 + 0.45 * severity  # 0.55..1.0
+
+        agree = min(0.6, agreement_bonus.get(idx, 0.0))  # 0..0.6
+        agree_weight = 1.0 + agree  # 1.0..1.6
+
+        # best matching event(s) in window
+        for ev in events:
+            dt = abs(ep["start"] - ev.ts)
             if dt <= window:
-                # Simple proximity score: closer => higher
-                # dt=0 => 1.0, dt=5min => ~0.0
-                proximity = max(0.0, 1.0 - (dt.total_seconds() / window.total_seconds()))
+                proximity = max(0.0, 1.0 - (dt.total_seconds() / window.total_seconds()))  # 0..1
+                prior = event_prior.get(ev.event_type, 0.6)  # default mid
 
-                key = ev.id
-                if key not in cause_stats:
-                    cause_stats[key] = {
-                        "score": 0.0,
-                        "evidence": [],
-                        "event": ev,
-                    }
+                # episode contributes:
+                contrib = proximity * prior * sev_weight * agree_weight
 
-                cause_stats[key]["score"] += proximity
-                cause_stats[key]["evidence"].append(
-                    f"{a.metric_name} anomalous at {a.ts.isoformat()} (z={a.z_score:.2f}) near event"
+                max_possible = max(max_possible, contrib)  # for normalization hint (not strict)
+
+                if ev.id not in cause:
+                    cause[ev.id] = {"score": 0.0, "evidence": [], "event": ev}
+
+                cause[ev.id]["score"] += contrib
+
+                pct = 0.0
+                if ep["baseline_mean"] > 1e-9:
+                    pct = (ep["max_value"] - ep["baseline_mean"]) / ep["baseline_mean"] * 100.0
+
+                cause[ev.id]["evidence"].append(
+                    f"{ep['metric']} abnormal {ep['start'].isoformat()}–{ep['end'].isoformat()}: "
+                    f"{ep['baseline_mean']:.2f} → {ep['max_value']:.2f} ({pct:+.1f}%), "
+                    f"z≈{ep['max_abs_z']:.2f}, event within {int(dt.total_seconds())}s"
                 )
 
-    # Convert to CauseOut list
+    # ---- 6) build response ----
+    # return point anomalies (fine for now) + ranked causes
     causes: list[CauseOut] = []
-    if cause_stats:
-        # Normalize confidence into [0,1] by dividing by max score
-        max_score = max(v["score"] for v in cause_stats.values()) or 1.0
-
-        for v in cause_stats.values():
+    if cause:
+        max_score = max(v["score"] for v in cause.values()) or 1.0
+        for v in cause.values():
             ev = v["event"]
-            confidence = v["score"] / max_score
-
+            conf = v["score"] / max_score
             causes.append(
                 CauseOut(
                     event_type=ev.event_type,
                     ts=ev.ts,
                     meta=ev.meta,
-                    confidence=round(confidence, 3),
-                    evidence=v["evidence"][:5],  # keep it short
+                    confidence=round(conf, 3),
+                    evidence=v["evidence"][:6],
                 )
             )
-
         causes.sort(key=lambda c: c.confidence, reverse=True)
 
     return AnalysisResponse(
         incident_id=incident_id,
-        anomalies=anomalies,
+        anomalies=point_anoms,
+        episodes=episodes_out,  # 👈 this is why we built it
         likely_causes=causes[:5],
     )

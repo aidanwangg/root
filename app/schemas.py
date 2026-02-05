@@ -51,7 +51,19 @@ class CauseOut(BaseModel):
     evidence: List[str] = Field(default_factory=list)
 
 
+class EpisodeOut(BaseModel):
+    metric_name: str
+    start_ts: datetime
+    end_ts: datetime
+    baseline_mean: float
+    baseline_std: float
+    peak_value: float
+    peak_z_score: float
+    percent_change: float
+
+
 class AnalysisResponse(BaseModel):
     incident_id: str
     anomalies: List[AnomalyOut]
+    episodes: List[EpisodeOut]
     likely_causes: List[CauseOut]
